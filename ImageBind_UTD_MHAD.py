@@ -80,6 +80,15 @@ def train_linear(train_loader, val_loader, model, model_linear, device):
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model_linear.parameters(), lr=0.001)
     num_epochs = 10
+    epoch=0
+
+    # Can delete this, just for debugging.
+    print("releasing cuda cache")
+    torch.cuda.empty_cache()
+    acc = evaluate(model, model_linear, val_loader, device)
+    print(f'Epoch [{epoch+1}/{num_epochs}],  Val Acc: {acc:.4f}')
+
+
     for epoch in range(num_epochs):
 
         for i,(frames, accel_data, labels, pid_idx, rgb_path, imu_path)  in enumerate(train_loader):
@@ -106,27 +115,35 @@ def train_linear(train_loader, val_loader, model, model_linear, device):
 
             if (i+1) % 10 == 0:
                 print (f'Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(train_loader)}], Loss: {loss.item():.4f}')
+        
         if (epoch+1) % 2 == 0:
-            acc = evaluate(model, val_loader, device)
+            print("releasing cuda cache")
+            torch.cuda.empty_cache()
+            acc = evaluate(model, model_linear, val_loader, device)
             print(f'Epoch [{epoch+1}/{num_epochs}],  Val Acc: {acc:.4f}')
             
-        print('Finished Training')
+            #save the model 
+            torch.save(model_linear.state_dict(), 'model_linear.ckpt')
+            
+            
+    print('Finished Training')
 
-def evaluate(model, val_loader, device):
+def evaluate(model, model_linear, val_loader, device):
     model.eval()
+    model_linear.eval()
     total_acc=0.
-    for i,(frames, accel_data, class_idx, pid_idx, rgb_path, imu_path)  in enumerate(val_loader):
+    for i,(frames, accel_data, labels, pid_idx, rgb_path, imu_path)  in enumerate(val_loader):
         total_acc=0.0
         with torch.no_grad():
             inputs = {
                 ModalityType.VISION: data.load_and_transform_video_data(rgb_path, device),
             }
-            labels = labels.to(device)
             emb = model(inputs)
             emb_vision = emb[ModalityType.VISION]
 
             out = model_linear(emb_vision)
             pred = out.cpu().argmax(dim=-1).type(torch.int)
+            labels = labels.cpu()
             acc = sum(torch.eq(labels,pred))/float(len(labels))
             total_acc+=acc
     total_acc/=len(val_loader) 
