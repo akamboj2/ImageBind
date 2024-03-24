@@ -14,7 +14,6 @@ import wandb
 import torchvision.transforms as transforms
 import torch.nn as nn
 
-wandb.init(project="imagebind-finetune")
 
 actions_dict = {
     1: 'A person swipes their hand to the left.',
@@ -46,6 +45,19 @@ actions_dict = {
     27: 'A person does a squat.'
 }
 
+def load_and_transform_imu(imu_data, device):
+    # currently imu is [1,180,6] but accroding to https://github.com/facebookresearch/ImageBind/issues/66 
+        # it should be [1, 6, 2000]
+    imu_data = torch.tensor(imu_data).to(device)
+    imu_data = imu_data.permute(0,2,1)
+
+    target_imu = torch.zeros(1,6,2000)
+    target_imu[:,:,:imu_data.shape[2]] = imu_data
+    target_imu = target_imu.to(device)
+    
+    return target_imu
+
+
 def zero_shot_imagebind(val_loader, model, device):
     model.eval()
 
@@ -57,9 +69,22 @@ def zero_shot_imagebind(val_loader, model, device):
 
         # print("RGB Path: ", rgb_path, class_idx)
         # Load and transform video data
+        text = data.load_and_transform_text(text_list, device)
+        video = data.load_and_transform_video_data(rgb_path, device)
+        imu = accel_data.to(device)
+        print("text shape: ", text.shape)
+        print("video shape: ", video.shape)
+        print("imu shape: ", imu.shape)
+        
+        imu = imu.permute(0,2,1)
+        target_imu = torch.zeros(1,6,2000)
+        target_imu[:,:,:imu.shape[2]] = imu
+        target_imu = target_imu.to(device)
+        print("target imu shape: ", target_imu.shape)
         inputs = {
-            ModalityType.TEXT: data.load_and_transform_text(text_list, device),
-            ModalityType.VISION: data.load_and_transform_video_data(rgb_path, device),
+            ModalityType.TEXT: text,
+            ModalityType.VISION: video,
+            ModalityType.IMU: target_imu
         }
 
         # print("Computing predictions... for ", v)
@@ -80,24 +105,18 @@ def zero_shot_imagebind(val_loader, model, device):
     print("Computing accuracy...")
     # print("Vision x Text: ", sftmx)
 
-    accuracy = correct / len(val_dataset)
+    accuracy = correct / len(val_dataset) * 100
     print("Accuracy: ", accuracy)
 
-def train_linear(train_loader, val_loader, model, model_linear, device):
+def train_linear(train_loader, val_loader, model, model_linear, sensors, device):
     # Train the model
     model.eval()
     model_linear.train()
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model_linear.parameters(), lr=0.001)
-    num_epochs = 10
+    optimizer = torch.optim.Adam(model_linear.parameters(), lr=0.01)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)  # Add scheduler
+    num_epochs = 100
     epoch=0
-
-    # Can delete this, just for debugging.
-    # print("releasing cuda cache")
-    # torch.cuda.empty_cache()
-    acc = evaluate(model, model_linear, val_loader, device)
-    print(f'Epoch [{epoch+1}/{num_epochs}],  Val Acc: {acc:.4f}')
-
 
     for epoch in range(num_epochs):
 
@@ -105,17 +124,29 @@ def train_linear(train_loader, val_loader, model, model_linear, device):
 
             # Load and transform video data
             with torch.no_grad():
-                inputs = {
-                    # ModalityType.TEXT: data.load_and_transform_text(text_list, device),
-                    ModalityType.VISION: data.load_and_transform_video_data(rgb_path, device),
-                }
-                # inputs = inputs.to(device)
-                labels = labels.to(device)
-                # Forward pass
-                emb = model(inputs)
-                emb_vision = emb[ModalityType.VISION]
+                if sensors =="both":
+                    inputs = {
+                        ModalityType.VISION: data.load_and_transform_video_data(rgb_path, device),
+                        ModalityType.IMU: data.load_and_transform_imu_data(imu_path, device)
+                    }
+                    emb = model(inputs)
+                    embedding_vector = (emb[ModalityType.VISION]+emb[ModalityType.IMU])/2
+                elif sensors == "vision":
+                    inputs = {
+                        ModalityType.VISION: data.load_and_transform_video_data(rgb_path, device),
+                    }
+                    emb = model(inputs)
+                    embedding_vector = emb[ModalityType.VISION]
 
-            outputs = model_linear(emb_vision)
+                elif sensors == "imu":
+                    inputs = {
+                        ModalityType.IMU: data.load_and_transform_imu_data(imu_path, device)
+                    }
+                    emb = model(inputs)
+                    embedding_vector = emb[ModalityType.IMU]
+
+            labels = labels.to(device)
+            outputs = model_linear(embedding_vector)
             loss = criterion(outputs, labels)
             # Backward and optimize
             optimizer.zero_grad()
@@ -126,39 +157,52 @@ def train_linear(train_loader, val_loader, model, model_linear, device):
                 print (f'Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(train_loader)}], Loss: {loss.item():.4f}')
                 wandb.log({"Train Loss": loss.item()})
         
+        scheduler.step()  # Step the scheduler
+
         if (epoch+1) % 2 == 0:
-            # print("releasing cuda cache")
-            # torch.cuda.empty_cache() #idk why, this prevents cuda out of memory error... but technially after the loop above, the memory should be flushed already...
-            acc = evaluate(model, model_linear, val_loader, device)
+            acc = evaluate(model, model_linear, sensors, val_loader, device)
             print(f'Epoch [{epoch+1}/{num_epochs}],  Val Acc: {acc:.4f}')
             wandb.log({"Val Accuracy": acc})
 
             #save the model 
-            torch.save(model_linear.state_dict(), 'model_linear.ckpt')
+            torch.save(model_linear.state_dict(), f'model_linear_{sensors}.ckpt')
 
-            
     print('Finished Training')
 
-def evaluate(model, model_linear, val_loader, device):
+def evaluate(model, model_linear, sensors, val_loader, device):
     model.eval()
     model_linear.eval()
-    total_acc=0.
+    correct = 0
+    total = 0
     for i,(frames, accel_data, labels, pid_idx, rgb_path, imu_path)  in enumerate(val_loader):
-        total_acc=0.0
         with torch.no_grad():
-            inputs = {
-                ModalityType.VISION: data.load_and_transform_video_data(rgb_path, device),
-            }
-            emb = model(inputs)
-            emb_vision = emb[ModalityType.VISION]
+            if sensors =="both":
+                inputs = {
+                    ModalityType.VISION: data.load_and_transform_video_data(rgb_path, device),
+                    ModalityType.IMU: data.load_and_transform_imu_data(imu_path, device)
+                }
+                emb = model(inputs)
+                embedding_vector = (emb[ModalityType.VISION]+emb[ModalityType.IMU])/2
+            elif sensors == "vision":
+                inputs = {
+                    ModalityType.VISION: data.load_and_transform_video_data(rgb_path, device),
+                }
+                emb = model(inputs)
+                embedding_vector = emb[ModalityType.VISION]
+            elif sensors == "imu":
+                inputs = {
+                    ModalityType.IMU: data.load_and_transform_imu_data(imu_path, device)
+                }
+                emb = model(inputs)
+                embedding_vector = emb[ModalityType.IMU]
 
-            out = model_linear(emb_vision)
+            out = model_linear(embedding_vector)
             pred = out.cpu().argmax(dim=-1).type(torch.int)
             labels = labels.cpu()
-            acc = sum(torch.eq(labels,pred))/float(len(labels))
-            total_acc+=acc
-    total_acc/=len(val_loader) 
-    return total_acc
+            total += labels.size(0)
+            correct += (pred == labels).sum()
+     
+    return 100.* correct/total
 
 
 if __name__ == "__main__":    
@@ -178,7 +222,7 @@ if __name__ == "__main__":
         transforms.ToTensor(),           # Convert frames to tensors
     ])
     rgb_video_length = 30
-    batch_size = 4
+    batch_size = 1
     datapath = "Both_splits/both_45_45_10_#1"
     base_path = "/home/akamboj2/data/utd-mhad/"
     train_dir = os.path.join("/home/akamboj2/data/utd-mhad/",datapath,"train.txt")
@@ -188,17 +232,25 @@ if __name__ == "__main__":
     val_dataset = RGB_IMU_Dataset(val_dir, video_length=rgb_video_length, transform=transforms, base_path=base_path, return_path=True)
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
 
+    sensors = "imu"
+    zero_shot = True
 
+    if zero_shot:
+        print("running zero shot ")
+        zero_shot_imagebind(val_loader, model, device)
+    else:
+        print("finetuning a linear layer:")
+        wandb.init(project="imagebind-finetune")
 
-    # Pytorch 2 layer MLP
-    model_linear = nn.Sequential(
-        nn.Linear(1024, 512),
-        nn.ReLU(),
-        nn.Linear(512, 27)
-    ) # don't need another relu, bc softmax (sigmoid activation) is applied in the loss function
-    model_linear.to(device)
+        # Pytorch 2 layer MLP
+        model_linear = nn.Sequential(
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, 27)
+        ) # don't need another relu, bc softmax (sigmoid activation) is applied in the loss function
+        model_linear.to(device)
 
-    train_linear(train_loader, val_loader, model, model_linear, device)
+        train_linear(train_loader, val_loader, model, model_linear, sensors, device)
 
 
    
