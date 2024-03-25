@@ -13,7 +13,8 @@ import os
 import wandb
 import torchvision.transforms as transforms
 import torch.nn as nn
-
+import argparse
+args = argparse.ArgumentParser()
 
 actions_dict = {
     1: 'A person swipes their hand to the left.',
@@ -45,20 +46,20 @@ actions_dict = {
     27: 'A person does a squat.'
 }
 
-def load_and_transform_imu(imu_data, device):
-    # currently imu is [1,180,6] but accroding to https://github.com/facebookresearch/ImageBind/issues/66 
-        # it should be [1, 6, 2000]
+def load_and_transform_imu_data(imu_data, device):
+    # currently imu is [batch_size,180,6] but accroding to https://github.com/facebookresearch/ImageBind/issues/66 
+        # it should be [batch_size, 6, 2000]
     imu_data = torch.tensor(imu_data).to(device)
     imu_data = imu_data.permute(0,2,1)
 
-    target_imu = torch.zeros(1,6,2000)
+    target_imu = torch.zeros(imu_data.shape[0],6,2000)
     target_imu[:,:,:imu_data.shape[2]] = imu_data
     target_imu = target_imu.to(device)
     
     return target_imu
 
 
-def zero_shot_imagebind(val_loader, model, device):
+def zero_shot_imagebind(val_loader, model, sensors, device):
     model.eval()
 
     text_list=list(actions_dict.values())
@@ -71,26 +72,18 @@ def zero_shot_imagebind(val_loader, model, device):
         # Load and transform video data
         text = data.load_and_transform_text(text_list, device)
         video = data.load_and_transform_video_data(rgb_path, device)
-        imu = accel_data.to(device)
-        print("text shape: ", text.shape)
-        print("video shape: ", video.shape)
-        print("imu shape: ", imu.shape)
-        
-        imu = imu.permute(0,2,1)
-        target_imu = torch.zeros(1,6,2000)
-        target_imu[:,:,:imu.shape[2]] = imu
-        target_imu = target_imu.to(device)
-        print("target imu shape: ", target_imu.shape)
+        imu = load_and_transform_imu_data(accel_data, device)
         inputs = {
             ModalityType.TEXT: text,
             ModalityType.VISION: video,
-            ModalityType.IMU: target_imu
+            ModalityType.IMU: imu
         }
 
         # print("Computing predictions... for ", v)
         with torch.no_grad():
             emb = model(inputs)
-            sftmx = torch.softmax(emb[ModalityType.VISION] @ emb[ModalityType.TEXT].T, dim=-1)
+            # sftmx = torch.softmax(emb[ModalityType.VISION] @ emb[ModalityType.TEXT].T, dim=-1)
+            sftmx = torch.softmax(emb[ModalityType.IMU] @ emb[ModalityType.TEXT].T, dim=-1)
         # print(sftmx)
         pred = torch.argmax(sftmx, dim=-1)
         predictions.append(pred.item())
@@ -127,7 +120,7 @@ def train_linear(train_loader, val_loader, model, model_linear, sensors, device)
                 if sensors =="both":
                     inputs = {
                         ModalityType.VISION: data.load_and_transform_video_data(rgb_path, device),
-                        ModalityType.IMU: data.load_and_transform_imu_data(imu_path, device)
+                        ModalityType.IMU: load_and_transform_imu_data(accel_data, device)
                     }
                     emb = model(inputs)
                     embedding_vector = (emb[ModalityType.VISION]+emb[ModalityType.IMU])/2
@@ -140,7 +133,7 @@ def train_linear(train_loader, val_loader, model, model_linear, sensors, device)
 
                 elif sensors == "imu":
                     inputs = {
-                        ModalityType.IMU: data.load_and_transform_imu_data(imu_path, device)
+                        ModalityType.IMU: load_and_transform_imu_data(accel_data, device)
                     }
                     emb = model(inputs)
                     embedding_vector = emb[ModalityType.IMU]
@@ -179,7 +172,7 @@ def evaluate(model, model_linear, sensors, val_loader, device):
             if sensors =="both":
                 inputs = {
                     ModalityType.VISION: data.load_and_transform_video_data(rgb_path, device),
-                    ModalityType.IMU: data.load_and_transform_imu_data(imu_path, device)
+                    ModalityType.IMU: load_and_transform_imu_data(accel_data, device)
                 }
                 emb = model(inputs)
                 embedding_vector = (emb[ModalityType.VISION]+emb[ModalityType.IMU])/2
@@ -191,7 +184,7 @@ def evaluate(model, model_linear, sensors, val_loader, device):
                 embedding_vector = emb[ModalityType.VISION]
             elif sensors == "imu":
                 inputs = {
-                    ModalityType.IMU: data.load_and_transform_imu_data(imu_path, device)
+                    ModalityType.IMU: load_and_transform_imu_data(accel_data, device)
                 }
                 emb = model(inputs)
                 embedding_vector = emb[ModalityType.IMU]
@@ -208,6 +201,11 @@ def evaluate(model, model_linear, sensors, val_loader, device):
 if __name__ == "__main__":    
     # video_paths=["/media/abhi/Seagate-FireCUDA/utd-mhad/RGB/a27_s4_t3_color.avi"]
 
+    args.add_argument("--sensors", type=str, default="both", help="Choose between vision, imu or both")
+    args.add_argument("--zero_shot", type=bool, default=False, help="Choose between vision, imu or both")
+    args.add_argument("--batch_size", type=int, default=4, help="Choose between vision, imu or both")
+    args = args.parse_args()
+
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
     # Instantiate model
@@ -222,22 +220,19 @@ if __name__ == "__main__":
         transforms.ToTensor(),           # Convert frames to tensors
     ])
     rgb_video_length = 30
-    batch_size = 1
     datapath = "Both_splits/both_45_45_10_#1"
     base_path = "/home/akamboj2/data/utd-mhad/"
     train_dir = os.path.join("/home/akamboj2/data/utd-mhad/",datapath,"train.txt")
     val_dir = os.path.join("/home/akamboj2/data/utd-mhad/",datapath,"val.txt")
     train_dataset = RGB_IMU_Dataset(train_dir, video_length=rgb_video_length, transform=transforms, base_path=base_path, return_path=True)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
     val_dataset = RGB_IMU_Dataset(val_dir, video_length=rgb_video_length, transform=transforms, base_path=base_path, return_path=True)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
 
-    sensors = "imu"
-    zero_shot = True
 
-    if zero_shot:
+    if args.zero_shot:
         print("running zero shot ")
-        zero_shot_imagebind(val_loader, model, device)
+        zero_shot_imagebind(val_loader, model, args.sensors, device)
     else:
         print("finetuning a linear layer:")
         wandb.init(project="imagebind-finetune")
@@ -250,7 +245,7 @@ if __name__ == "__main__":
         ) # don't need another relu, bc softmax (sigmoid activation) is applied in the loss function
         model_linear.to(device)
 
-        train_linear(train_loader, val_loader, model, model_linear, sensors, device)
+        train_linear(train_loader, val_loader, model, model_linear, args.sensors, device)
 
 
    
