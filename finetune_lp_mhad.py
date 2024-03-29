@@ -106,7 +106,7 @@ def train_linear(train_loader, val_loader, model, model_linear, sensors, device)
     model.eval()
     model_linear.train()
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model_linear.parameters(), lr=0.01)
+    optimizer = torch.optim.Adam(model_linear.parameters(), lr=0.1)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)  # Add scheduler
     num_epochs = 100
     epoch=0
@@ -201,7 +201,7 @@ def evaluate(model, model_linear, sensors, val_loader, device):
 if __name__ == "__main__":    
     # video_paths=["/media/abhi/Seagate-FireCUDA/utd-mhad/RGB/a27_s4_t3_color.avi"]
 
-    args.add_argument("--sensors", type=str, default="both", help="Choose between vision, imu or both")
+    args.add_argument("--sensors", type=str, default="vision", help="Choose between vision, imu or both")
     args.add_argument("--zero_shot", type=bool, default=False, help="Choose between vision, imu or both")
     args.add_argument("--batch_size", type=int, default=4, help="Choose between vision, imu or both")
     args = args.parse_args()
