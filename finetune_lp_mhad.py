@@ -8,6 +8,9 @@ import torch
 from imagebind.models import imagebind_model
 from imagebind.models.imagebind_model import ModalityType
 from linked_dataset import RGB_IMU_Dataset
+from dataset_mmact import MMACT
+from dataset_mhad import CZUMHADDataset
+
 import os
 
 import wandb
@@ -101,14 +104,14 @@ def zero_shot_imagebind(val_loader, model, sensors, device):
     accuracy = correct / len(val_dataset) * 100
     print("Accuracy: ", accuracy)
 
-def train_linear(train_loader, val_loader, model, model_linear, sensors, device):
+def train_linear(train_loader, val_loader, model, model_linear, sensors, device, args):
     # Train the model
     model.eval()
     model_linear.train()
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model_linear.parameters(), lr=0.1)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)  # Add scheduler
-    num_epochs = 100
+    num_epochs = 10
     epoch=0
 
     for epoch in range(num_epochs):
@@ -137,6 +140,12 @@ def train_linear(train_loader, val_loader, model, model_linear, sensors, device)
                     }
                     emb = model(inputs)
                     embedding_vector = emb[ModalityType.IMU]
+                elif sensors == "depth":
+                    inputs = {
+                        ModalityType.DEPTH: frames.to(device),
+                    }
+                    emb = model(inputs)
+                    embedding_vector = emb[ModalityType.DEPTH]
 
             labels = labels.to(device)
             outputs = model_linear(embedding_vector)
@@ -148,14 +157,14 @@ def train_linear(train_loader, val_loader, model, model_linear, sensors, device)
 
             if (i+1) % 10 == 0:
                 print (f'Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(train_loader)}], Loss: {loss.item():.4f}')
-                wandb.log({"Train Loss": loss.item()})
+                if args.wandb: wandb.log({"Train Loss": loss.item()})
         
         scheduler.step()  # Step the scheduler
 
         if (epoch+1) % 2 == 0:
             acc = evaluate(model, model_linear, sensors, val_loader, device)
             print(f'Epoch [{epoch+1}/{num_epochs}],  Val Acc: {acc:.4f}')
-            wandb.log({"Val Accuracy": acc})
+            if args.wandb: wandb.log({"Val Accuracy": acc})
 
             #save the model 
             torch.save(model_linear.state_dict(), f'model_linear_{sensors}.ckpt')
@@ -188,6 +197,13 @@ def evaluate(model, model_linear, sensors, val_loader, device):
                 }
                 emb = model(inputs)
                 embedding_vector = emb[ModalityType.IMU]
+            elif sensors == "depth":
+                # print("in here")
+                inputs = {
+                    ModalityType.DEPTH: frames.to(device),
+                }
+                emb = model(inputs)
+                embedding_vector = emb[ModalityType.DEPTH]
 
             out = model_linear(embedding_vector)
             pred = out.cpu().argmax(dim=-1).type(torch.int)
@@ -200,19 +216,23 @@ def evaluate(model, model_linear, sensors, val_loader, device):
 
 if __name__ == "__main__":    
     # video_paths=["/media/abhi/Seagate-FireCUDA/utd-mhad/RGB/a27_s4_t3_color.avi"]
-
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
     args.add_argument("--sensors", type=str, default="vision", help="Choose between vision, imu or both")
     args.add_argument("--zero_shot", type=bool, default=False, help="Choose between vision, imu or both")
-    args.add_argument("--batch_size", type=int, default=4, help="Choose between vision, imu or both")
+    args.add_argument("--batch_size", type=int, default=8, help="Choose between vision, imu or both")
+    args.add_argument("--device", type=str, default=device, help="cuda device")
+    args.add_argument("--dataset", type=str, default="utd-mhad", help="Choose between utd-mhad, mmact, mmea, czu-mhad")
+    args.add_argument("--wandb", type=bool, default=False, help="Choose between utd-mhad, mmact, mmea, czu-mhad")
     args = args.parse_args()
 
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    device = args.device
 
     # Instantiate model
     model = imagebind_model.imagebind_huge(pretrained=True)
     model.to(device)
+    print("Device", device)
     model.eval()
-
+    # print(model.device)
     print("Loading test data...")
     transforms = transforms.Compose([
         transforms.ToPILImage(),
@@ -220,32 +240,135 @@ if __name__ == "__main__":
         transforms.ToTensor(),           # Convert frames to tensors
     ])
     rgb_video_length = 30
-    datapath = "Both_splits/both_45_45_10_#1"
-    base_path = "/home/akamboj2/data/utd-mhad/"
-    train_dir = os.path.join("/home/akamboj2/data/utd-mhad/",datapath,"train.txt")
-    val_dir = os.path.join("/home/akamboj2/data/utd-mhad/",datapath,"val.txt")
-    train_dataset = RGB_IMU_Dataset(train_dir, video_length=rgb_video_length, transform=transforms, base_path=base_path, return_path=True)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
-    val_dataset = RGB_IMU_Dataset(val_dir, video_length=rgb_video_length, transform=transforms, base_path=base_path, return_path=True)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    # datapath = "Both_splits/both_45_45_10_#1"
+    # base_path = "/home/akamboj2/data/utd-mhad/"
+    # train_dir = os.path.join("/home/akamboj2/data/utd-mhad/",datapath,"train.txt")
+    # val_dir = os.path.join("/home/akamboj2/data/utd-mhad/",datapath,"val.txt")
+    # train_dataset = RGB_IMU_Dataset(train_dir, video_length=rgb_video_length, transform=transforms, base_path=base_path, return_path=True)
+    # train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    # val_dataset = RGB_IMU_Dataset(val_dir, video_length=rgb_video_length, transform=transforms, base_path=base_path, return_path=True)
+    # val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
 
 
+    dataset = 'mmact'
+    args.dataset = dataset
+    if dataset=='utd-mhad':
+        datapath = "Both_splits/both_40_40_10_10_#1" #all models should use the same split for comparison
+        # datapath = "Inertial_splits/action_80_20_#1" if label_category == 'action' else "Inertial_splits/pid_80_20_#1"
+        # if model_info['fusion_type'] in ['cross_modal', 'student_teacher']:
+            # datapath = "Both_splits/both_42.5_42.5_5_10_#1"
+            # datapath = "Both_splits/both_45_45_10_#1"
+            # datapath = "Both_splits/both_40_40_10_10_#1" 
+        # else:
+            # datapath = "Both_splits/both_80_20_#1"
+
+        base_path = "/home/akamboj2/data/utd-mhad/"
+        train_dir = os.path.join(base_path,datapath,"train.txt")
+        val_dir = os.path.join(base_path, datapath,"val.txt")
+        test_dir = os.path.join(base_path, datapath,"test.txt")
+
+        train_dataset = RGB_IMU_Dataset(train_dir, video_length=rgb_video_length, transform=transforms, base_path=base_path, return_path=True)
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+        val_dataset = RGB_IMU_Dataset(val_dir, video_length=rgb_video_length, transform=transforms, base_path=base_path, return_path=True)
+        val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+        test_dataset = RGB_IMU_Dataset(test_dir, video_length=rgb_video_length, transform=transforms, base_path=base_path, return_path=True)
+        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+
+        # if model_info['fusion_type'] == 'cross_modal':
+        #NOTE train_2 is the (X_rgb,Y) used for HAR, train_1 is the (X_IMU, Y)
+        train_2_dir = os.path.join(base_path, datapath,"train_2.txt")
+        train_2_dataset = RGB_IMU_Dataset(train_2_dir, video_length=rgb_video_length, transform=transforms, base_path=base_path, return_path=True)
+        train_2_loader = torch.utils.data.DataLoader(train_2_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    elif dataset=='mmact':
+        # base_path = "/home/akamboj2/data/mmact/FACT_splits/"
+        # base_path = "/home/akamboj2/data/mmact/FACT_presaved/"
+        base_path = "/home/akamboj2/data/mmact/FACT_presaved_all_sensors/"
+        train_dir = os.path.join(base_path,"train_align.txt")
+        train_2_dir = os.path.join(base_path,"train_har.txt")
+        val_dir = os.path.join(base_path,"val.txt")
+        test_dir = os.path.join(base_path,"test.txt")
+        num_workers = 4
+        # i've experimented around with this. looks like 12 is good. every 12 iteration of dataloader is slower, but the next 12 is faster
+        # or 8 works too, it seems like 16 has a hihger chance of crashing
+        train_dataset = MMACT(train_dir, video_length=rgb_video_length, transform=transforms, presaved=True, return_path=True)
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+        train_2_dataset = MMACT(train_2_dir, video_length=rgb_video_length, transform=transforms, presaved=True, return_path=True)
+        train_2_loader = torch.utils.data.DataLoader(train_2_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+        val_dataset = MMACT(val_dir, video_length=rgb_video_length, transform=transforms, presaved=True, return_path=True)
+        val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+        test_dataset = MMACT(test_dir, video_length=rgb_video_length, transform=transforms, presaved=True, return_path=True)
+        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+    elif dataset=='mmea':
+        base_path = "/home/akamboj2/data/UESTC-MMEA-CL/FACT_splits"
+        train_dir = os.path.join(base_path,"train_align.txt")
+        train_2_dir = os.path.join(base_path,"train_har.txt")
+        val_dir = os.path.join(base_path,"val.txt")
+        test_dir = os.path.join(base_path,"test.txt")
+        data_path = "/home/akamboj2/data/UESTC-MMEA-CL/"
+        num_workers = 4
+        train_dataset = RGB_IMU_Dataset(train_dir, video_length=rgb_video_length, transform=transforms, dataset='mmea',base_path=data_path, return_path=True)
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+        train_2_dataset = RGB_IMU_Dataset(train_2_dir, video_length=rgb_video_length, transform=transforms, dataset='mmea',base_path=data_path, return_path=True)
+        train_2_loader = torch.utils.data.DataLoader(train_2_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+        val_dataset = RGB_IMU_Dataset(val_dir, video_length=rgb_video_length, transform=transforms, dataset='mmea',base_path=data_path)
+        val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+        test_dataset = RGB_IMU_Dataset(test_dir, video_length=rgb_video_length, transform=transforms, dataset='mmea',base_path=data_path, return_path=True)
+        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+    elif dataset=='czu-mhad':
+        base_path = "/home/akamboj2/data/CZU-MHAD"
+        train_dir = "train_align"
+        train_2_dir = "train_har"
+        val_dir = "val"
+        test_dir = "test"
+        num_workers = 4
+        train_dataset = CZUMHADDataset(base_path, train_dir, video_length=rgb_video_length, transform=transforms, return_path=True)
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+        train_2_dataset = CZUMHADDataset(base_path, train_2_dir, video_length=rgb_video_length, transform=transforms, return_path=True)
+        train_2_loader = torch.utils.data.DataLoader(train_2_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+        val_dataset = CZUMHADDataset(base_path, val_dir, video_length=rgb_video_length, transform=transforms, return_path=True)
+        val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+        test_dataset = CZUMHADDataset(base_path, test_dir, video_length=rgb_video_length, transform=transforms, return_path=True)
+        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+
+    model_info={}
+    model_info['dataset'] = dataset
+    if dataset == 'utd-mhad':
+        num_imu_channels = 6
+    elif dataset == 'mmact':
+        num_imu_channels = 12
+        model_info['num_classes'] = 35
+    elif dataset == 'mmea':
+        num_imu_channels = 6
+        model_info['num_classes'] = 32
+    elif dataset == 'czu-mhad':
+        num_imu_channels = 60
+        model_info['num_classes'] = 22
+    else:
+        raise NotImplementedError("Dataset not implemented: ", dataset)
+
+    print(args)
+    print(model_info)
     if args.zero_shot:
         print("running zero shot ")
         zero_shot_imagebind(val_loader, model, args.sensors, device)
     else:
         print("finetuning a linear layer:")
-        wandb.init(project="imagebind-finetune")
+        if args.wandb: wandb.init(project="imagebind-finetune")
 
         # Pytorch 2 layer MLP
         model_linear = nn.Sequential(
             nn.Linear(1024, 512),
             nn.ReLU(),
-            nn.Linear(512, 27)
+            nn.Linear(512, model_info['num_classes'])
         ) # don't need another relu, bc softmax (sigmoid activation) is applied in the loss function
         model_linear.to(device)
 
-        train_linear(train_loader, val_loader, model, model_linear, args.sensors, device)
 
+        # args.sensors = "vision"
+        args.sensors = "vision"
+        train_linear(train_2_loader, test_loader, model, model_linear, args.sensors, device, args)
 
-   
+        # args.sensors = "imu"
+        # train_linear(train_loader, test_loader, model, model_linear, args.sensors, device)
+
+        # evaluate(model, model_linear, args.sensors, test_loader, device)
