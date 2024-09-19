@@ -7,9 +7,9 @@ from imagebind import data
 import torch
 from imagebind.models import imagebind_model
 from imagebind.models.imagebind_model import ModalityType
-from linked_dataset import RGB_IMU_Dataset
-from dataset_mmact import MMACT
-from dataset_mhad import CZUMHADDataset
+from datasets.dataset import RGB_IMU_Dataset, load_dataloaders
+# from dataset_mmact import MMACT
+# from dataset_mhad import CZUMHADDataset
 
 import os
 
@@ -223,6 +223,7 @@ if __name__ == "__main__":
     args.add_argument("--device", type=str, default=device, help="cuda device")
     args.add_argument("--dataset", type=str, default="utd-mhad", help="Choose between utd-mhad, mmact, mmea, czu-mhad")
     args.add_argument("--wandb", type=bool, default=False, help="Choose between utd-mhad, mmact, mmea, czu-mhad")
+    args.add_argument('--single_gpu', action='store_true',default=True) # default use DDP multi GPU.
     args = args.parse_args()
 
     device = args.device
@@ -250,101 +251,119 @@ if __name__ == "__main__":
     # val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
 
 
-    dataset = 'mmact'
-    args.dataset = dataset
-    if dataset=='utd-mhad':
-        datapath = "Both_splits/both_40_40_10_10_#1" #all models should use the same split for comparison
-        # datapath = "Inertial_splits/action_80_20_#1" if label_category == 'action' else "Inertial_splits/pid_80_20_#1"
-        # if model_info['fusion_type'] in ['cross_modal', 'student_teacher']:
-            # datapath = "Both_splits/both_42.5_42.5_5_10_#1"
-            # datapath = "Both_splits/both_45_45_10_#1"
-            # datapath = "Both_splits/both_40_40_10_10_#1" 
-        # else:
-            # datapath = "Both_splits/both_80_20_#1"
 
-        base_path = "/home/akamboj2/data/utd-mhad/"
-        train_dir = os.path.join(base_path,datapath,"train.txt")
-        val_dir = os.path.join(base_path, datapath,"val.txt")
-        test_dir = os.path.join(base_path, datapath,"test.txt")
+    model_info = {
+        'sensors' : ['RGB', 'IMU'], #['RGB', 'IMU'] #NOTE: Keep the order here consistent for naming purposes
+        'tasks' : ['HAR'], #['HAR', 'PID'],
+        'fusion_type' : 'imagebind', #'middle', #'cross_modal', # 'early', 'middle', 'late', 'cross_modal', 'student_teacher
+        'num_classes' : -1, # Will be replaced in load_dataloaders depending on the dataset
+        'project_name' : ""
+    }
 
-        train_dataset = RGB_IMU_Dataset(train_dir, video_length=rgb_video_length, transform=transforms, base_path=base_path, return_path=True)
-        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
-        val_dataset = RGB_IMU_Dataset(val_dir, video_length=rgb_video_length, transform=transforms, base_path=base_path, return_path=True)
-        val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
-        test_dataset = RGB_IMU_Dataset(test_dir, video_length=rgb_video_length, transform=transforms, base_path=base_path, return_path=True)
-        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    HOME_DIR = os.environ['HOME']
+    dataset = args.dataset
+    rgb_video_length = 30
+    imu_length = 180
+    world_size = 1
 
-        # if model_info['fusion_type'] == 'cross_modal':
-        #NOTE train_2 is the (X_rgb,Y) used for HAR, train_1 is the (X_IMU, Y)
-        train_2_dir = os.path.join(base_path, datapath,"train_2.txt")
-        train_2_dataset = RGB_IMU_Dataset(train_2_dir, video_length=rgb_video_length, transform=transforms, base_path=base_path, return_path=True)
-        train_2_loader = torch.utils.data.DataLoader(train_2_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
-    elif dataset=='mmact':
-        # base_path = "/home/akamboj2/data/mmact/FACT_splits/"
-        # base_path = "/home/akamboj2/data/mmact/FACT_presaved/"
-        base_path = "/home/akamboj2/data/mmact/FACT_presaved_all_sensors/"
-        train_dir = os.path.join(base_path,"train_align.txt")
-        train_2_dir = os.path.join(base_path,"train_har.txt")
-        val_dir = os.path.join(base_path,"val.txt")
-        test_dir = os.path.join(base_path,"test.txt")
-        num_workers = 4
-        # i've experimented around with this. looks like 12 is good. every 12 iteration of dataloader is slower, but the next 12 is faster
-        # or 8 works too, it seems like 16 has a hihger chance of crashing
-        train_dataset = MMACT(train_dir, video_length=rgb_video_length, transform=transforms, presaved=True, return_path=True)
-        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
-        train_2_dataset = MMACT(train_2_dir, video_length=rgb_video_length, transform=transforms, presaved=True, return_path=True)
-        train_2_loader = torch.utils.data.DataLoader(train_2_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
-        val_dataset = MMACT(val_dir, video_length=rgb_video_length, transform=transforms, presaved=True, return_path=True)
-        val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
-        test_dataset = MMACT(test_dir, video_length=rgb_video_length, transform=transforms, presaved=True, return_path=True)
-        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
-    elif dataset=='mmea':
-        base_path = "/home/akamboj2/data/UESTC-MMEA-CL/FACT_splits"
-        train_dir = os.path.join(base_path,"train_align.txt")
-        train_2_dir = os.path.join(base_path,"train_har.txt")
-        val_dir = os.path.join(base_path,"val.txt")
-        test_dir = os.path.join(base_path,"test.txt")
-        data_path = "/home/akamboj2/data/UESTC-MMEA-CL/"
-        num_workers = 4
-        train_dataset = RGB_IMU_Dataset(train_dir, video_length=rgb_video_length, transform=transforms, dataset='mmea',base_path=data_path, return_path=True)
-        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
-        train_2_dataset = RGB_IMU_Dataset(train_2_dir, video_length=rgb_video_length, transform=transforms, dataset='mmea',base_path=data_path, return_path=True)
-        train_2_loader = torch.utils.data.DataLoader(train_2_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
-        val_dataset = RGB_IMU_Dataset(val_dir, video_length=rgb_video_length, transform=transforms, dataset='mmea',base_path=data_path)
-        val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
-        test_dataset = RGB_IMU_Dataset(test_dir, video_length=rgb_video_length, transform=transforms, dataset='mmea',base_path=data_path, return_path=True)
-        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
-    elif dataset=='czu-mhad':
-        base_path = "/home/akamboj2/data/CZU-MHAD"
-        train_dir = "train_align"
-        train_2_dir = "train_har"
-        val_dir = "val"
-        test_dir = "test"
-        num_workers = 4
-        train_dataset = CZUMHADDataset(base_path, train_dir, video_length=rgb_video_length, transform=transforms, return_path=True)
-        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
-        train_2_dataset = CZUMHADDataset(base_path, train_2_dir, video_length=rgb_video_length, transform=transforms, return_path=True)
-        train_2_loader = torch.utils.data.DataLoader(train_2_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
-        val_dataset = CZUMHADDataset(base_path, val_dir, video_length=rgb_video_length, transform=transforms, return_path=True)
-        val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
-        test_dataset = CZUMHADDataset(base_path, test_dir, video_length=rgb_video_length, transform=transforms, return_path=True)
-        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+    # Load the dataloaders
+    train_loader, train_2_loader, val_loader, test_loader, model_info = load_dataloaders(dataset, model_info, rgb_video_length, imu_length, world_size, args, return_path=True)
 
-    model_info={}
-    model_info['dataset'] = dataset
-    if dataset == 'utd-mhad':
-        num_imu_channels = 6
-    elif dataset == 'mmact':
-        num_imu_channels = 12
-        model_info['num_classes'] = 35
-    elif dataset == 'mmea':
-        num_imu_channels = 6
-        model_info['num_classes'] = 32
-    elif dataset == 'czu-mhad':
-        num_imu_channels = 60
-        model_info['num_classes'] = 22
-    else:
-        raise NotImplementedError("Dataset not implemented: ", dataset)
+    # if args.dataset=='utd-mhad':
+    #     datapath = "Both_splits/both_40_40_10_10_#1" #all models should use the same split for comparison
+    #     # datapath = "Inertial_splits/action_80_20_#1" if label_category == 'action' else "Inertial_splits/pid_80_20_#1"
+    #     # if model_info['fusion_type'] in ['cross_modal', 'student_teacher']:
+    #         # datapath = "Both_splits/both_42.5_42.5_5_10_#1"
+    #         # datapath = "Both_splits/both_45_45_10_#1"
+    #         # datapath = "Both_splits/both_40_40_10_10_#1" 
+    #     # else:
+    #         # datapath = "Both_splits/both_80_20_#1"
+
+    #     base_path = f"{HOME_DIR}/data/utd-mhad/"
+    #     train_dir = os.path.join(base_path,datapath,"train.txt")
+    #     train_2_dir = os.path.join(base_path, datapath,"train_2.txt")
+    #     val_dir = os.path.join(base_path, datapath,"val.txt")
+    #     test_dir = os.path.join(base_path, datapath,"test.txt")
+
+    #     train_dataset = RGB_IMU_Dataset(train_dir, video_length=rgb_video_length, transform=transforms, base_path=base_path, return_path=True)
+    #     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    #     val_dataset = RGB_IMU_Dataset(val_dir, video_length=rgb_video_length, transform=transforms, base_path=base_path, return_path=True)
+    #     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    #     test_dataset = RGB_IMU_Dataset(test_dir, video_length=rgb_video_length, transform=transforms, base_path=base_path, return_path=True)
+    #     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+
+    #     # if model_info['fusion_type'] == 'cross_modal':
+    #     #NOTE train_2 is the (X_rgb,Y) used for HAR, train_1 is the (X_IMU, Y)
+    #     train_2_dir = os.path.join(base_path, datapath,"train_2.txt")
+    #     train_2_dataset = RGB_IMU_Dataset(train_2_dir, video_length=rgb_video_length, transform=transforms, base_path=base_path, return_path=True)
+    #     train_2_loader = torch.utils.data.DataLoader(train_2_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    # elif args.dataset=='mmact':
+    #     # base_path = "/home/akamboj2/data/mmact/FACT_splits/"
+    #     # base_path = "/home/akamboj2/data/mmact/FACT_presaved/"
+    #     base_path = "/home/akamboj2/data/mmact/FACT_presaved_all_sensors/"
+    #     train_dir = os.path.join(base_path,"train_align.txt")
+    #     train_2_dir = os.path.join(base_path,"train_har.txt")
+    #     val_dir = os.path.join(base_path,"val.txt")
+    #     test_dir = os.path.join(base_path,"test.txt")
+    #     num_workers = 4
+    #     # i've experimented around with this. looks like 12 is good. every 12 iteration of dataloader is slower, but the next 12 is faster
+    #     # or 8 works too, it seems like 16 has a hihger chance of crashing
+    #     train_dataset = MMACT(train_dir, video_length=rgb_video_length, transform=transforms, presaved=True, return_path=True)
+    #     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+    #     train_2_dataset = MMACT(train_2_dir, video_length=rgb_video_length, transform=transforms, presaved=True, return_path=True)
+    #     train_2_loader = torch.utils.data.DataLoader(train_2_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+    #     val_dataset = MMACT(val_dir, video_length=rgb_video_length, transform=transforms, presaved=True, return_path=True)
+    #     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+    #     test_dataset = MMACT(test_dir, video_length=rgb_video_length, transform=transforms, presaved=True, return_path=True)
+    #     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+    # elif args.dataset=='mmea':
+    #     base_path = "/home/akamboj2/data/UESTC-MMEA-CL/FACT_splits"
+    #     train_dir = os.path.join(base_path,"train_align.txt")
+    #     train_2_dir = os.path.join(base_path,"train_har.txt")
+    #     val_dir = os.path.join(base_path,"val.txt")
+    #     test_dir = os.path.join(base_path,"test.txt")
+    #     data_path = "/home/akamboj2/data/UESTC-MMEA-CL/"
+    #     num_workers = 4
+    #     train_dataset = RGB_IMU_Dataset(train_dir, video_length=rgb_video_length, transform=transforms, dataset='mmea',base_path=data_path, return_path=True)
+    #     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+    #     train_2_dataset = RGB_IMU_Dataset(train_2_dir, video_length=rgb_video_length, transform=transforms, dataset='mmea',base_path=data_path, return_path=True)
+    #     train_2_loader = torch.utils.data.DataLoader(train_2_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+    #     val_dataset = RGB_IMU_Dataset(val_dir, video_length=rgb_video_length, transform=transforms, dataset='mmea',base_path=data_path)
+    #     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+    #     test_dataset = RGB_IMU_Dataset(test_dir, video_length=rgb_video_length, transform=transforms, dataset='mmea',base_path=data_path, return_path=True)
+    #     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+    # elif args.dataset=='czu-mhad':
+        # base_path = "/home/akamboj2/data/CZU-MHAD"
+        # train_dir = "train_align"
+        # train_2_dir = "train_har"
+        # val_dir = "val"
+        # test_dir = "test"
+        # num_workers = 4
+        # train_dataset = CZUMHADDataset(base_path, train_dir, video_length=rgb_video_length, transform=transforms, return_path=True)
+        # train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+        # train_2_dataset = CZUMHADDataset(base_path, train_2_dir, video_length=rgb_video_length, transform=transforms, return_path=True)
+        # train_2_loader = torch.utils.data.DataLoader(train_2_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+        # val_dataset = CZUMHADDataset(base_path, val_dir, video_length=rgb_video_length, transform=transforms, return_path=True)
+        # val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+        # test_dataset = CZUMHADDataset(base_path, test_dir, video_length=rgb_video_length, transform=transforms, return_path=True)
+        # test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+
+    # model_info={}
+    # model_info['dataset'] = args.dataset
+    # if args.dataset == 'utd-mhad':
+    #     num_imu_channels = 6
+    #     model_info['num_classes'] = 27
+    # elif args.dataset == 'mmact':
+    #     num_imu_channels = 12
+    #     model_info['num_classes'] = 35
+    # elif args.dataset == 'mmea':
+    #     num_imu_channels = 6
+    #     model_info['num_classes'] = 32
+    # elif args.dataset == 'czu-mhad':
+    #     num_imu_channels = 60
+    #     model_info['num_classes'] = 22
+    # else:
+    #     raise NotImplementedError("Dataset not implemented: ", args.dataset)
 
     print(args)
     print(model_info)
@@ -364,7 +383,9 @@ if __name__ == "__main__":
         model_linear.to(device)
 
 
-        # args.sensors = "vision"
+        # TODO: Maybe should first align with both imu and vision modalities
+        
+        # Train the task head with just vision modality
         args.sensors = "vision"
         train_linear(train_2_loader, test_loader, model, model_linear, args.sensors, device, args)
 
