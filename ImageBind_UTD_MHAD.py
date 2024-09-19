@@ -1,3 +1,7 @@
+"""
+deprecated... i think
+use finetune_lp_mhad.py instead
+"""
 from imagebind import data
 import torch
 from imagebind.models import imagebind_model
