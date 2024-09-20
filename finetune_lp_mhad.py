@@ -17,7 +17,9 @@ import wandb
 import torchvision.transforms as transforms
 import torch.nn as nn
 import argparse
-args = argparse.ArgumentParser()
+
+import torch.distributed as dist
+
 
 actions_dict = {
     1: 'A person swipes their hand to the left.',
@@ -104,142 +106,188 @@ def zero_shot_imagebind(val_loader, model, sensors, device):
     accuracy = correct / len(val_dataset) * 100
     print("Accuracy: ", accuracy)
 
-def train_linear(train_loader, val_loader, model, sensors, device, args):
-    # Train the model
-    model.model_ib.eval()
-    model.model_linear.train()
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.model_linear.parameters(), lr=0.1)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)  # Add scheduler
-    num_epochs = 10
-    epoch=0
 
-    for epoch in range(num_epochs):
+class ImageBind_baseline(nn.Module):
+    def __init__(self, output_size):
+        super(ImageBind_baseline, self).__init__()
+        # Instantiate model
+        self.model_ib = imagebind_model.imagebind_huge(pretrained=True)
+        self.model_linear = nn.Sequential(# Pytorch 2 layer MLP
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, output_size)
+        ) # don't need another relu, bc softmax (sigmoid activation) is applied in the loss function
 
-        for i,(frames, accel_data, labels, pid_idx, rgb_path, imu_path)  in enumerate(train_loader):
-            break
-            # Load and transform video data
-            with torch.no_grad():
-                if sensors =="both":
-                    inputs = {
-                        ModalityType.VISION: data.load_and_transform_video_data(rgb_path, device),
-                        ModalityType.IMU: load_and_transform_imu_data(accel_data, device)
-                    }
-                    emb = model.model_ib(inputs)
-                    embedding_vector = (emb[ModalityType.VISION]+emb[ModalityType.IMU])/2
-                elif sensors == "vision": #might be an easier way to write this
-                    inputs = {
-                        ModalityType.VISION: data.load_and_transform_video_data(rgb_path, device),
-                    }
-                    emb = model.model_ib(inputs)
-                    embedding_vector = emb[ModalityType.VISION]
-
-                elif sensors == "imu":
-                    inputs = {
-                        ModalityType.IMU: load_and_transform_imu_data(accel_data, device)
-                    }
-                    emb = model.model_ib(inputs)
-                    embedding_vector = emb[ModalityType.IMU]
-                elif sensors == "depth":
-                    inputs = {
-                        ModalityType.DEPTH: frames.to(device),
-                    }
-                    emb = model.model_ib(inputs)
-                    embedding_vector = emb[ModalityType.DEPTH]
-
-            labels = labels.to(device)
-            outputs = model.model_linear(embedding_vector)
-            loss = criterion(outputs, labels)
-            # Backward and optimize
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            if (i+1) % 10 == 0:
-                print (f'Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(train_loader)}], Loss: {loss.item():.4f}')
-                if args.wandb: wandb.log({"Train Loss": loss.item()})
-        
-        scheduler.step()  # Step the scheduler
-
-        if (epoch+1) % 2 == 0:
-            acc = evaluate(model, sensors, val_loader, device)
-            print(f'Epoch [{epoch+1}/{num_epochs}],  Val Acc: {acc:.4f}')
-            if args.wandb: wandb.log({"Val Accuracy": acc})
-
-            #save the model 
-            torch.save(model.state_dict(), f'model_linear_{sensors}.ckpt')
-
-    print('Finished Training')
-
-def evaluate(model, sensors, val_loader, device):
-    model.eval()
-    correct = 0
-    total = 0
-    for i,(frames, accel_data, labels, pid_idx, rgb_path, imu_path)  in enumerate(val_loader):
+    def forward(self, inputs, sensors, device, fine_tune=False, clip_align=False):
+        if fine_tune:
+            self.model_ib.eval() # Might need to manually freeze the weights, this might not be enough
+            self.model_linear.train()
+        # Load and transform video data
+        frames, accel_data, labels, pid_idx, rgb_path, imu_path  = inputs
         with torch.no_grad():
             if sensors =="both":
                 inputs = {
                     ModalityType.VISION: data.load_and_transform_video_data(rgb_path, device),
                     ModalityType.IMU: load_and_transform_imu_data(accel_data, device)
                 }
-                emb = model.model_ib(inputs)
+                emb = self.model_ib(inputs)
                 embedding_vector = (emb[ModalityType.VISION]+emb[ModalityType.IMU])/2
-            elif sensors == "vision":
+            elif sensors == "vision": #might be an easier way to write this
                 inputs = {
                     ModalityType.VISION: data.load_and_transform_video_data(rgb_path, device),
                 }
-                emb = model.model_ib(inputs)
+                emb = self.model_ib(inputs)
                 embedding_vector = emb[ModalityType.VISION]
+
             elif sensors == "imu":
                 inputs = {
                     ModalityType.IMU: load_and_transform_imu_data(accel_data, device)
                 }
-                emb = model.model_ib(inputs)
+                emb = self.model_ib(inputs)
                 embedding_vector = emb[ModalityType.IMU]
             elif sensors == "depth":
-                # print("in here")
                 inputs = {
                     ModalityType.DEPTH: frames.to(device),
                 }
-                emb = model.model_ib(inputs)
+                emb = self.model_ib(inputs)
                 embedding_vector = emb[ModalityType.DEPTH]
+            else:
+                raise ValueError("Invalid sensor type: ", sensors)
 
-            out = model.model_linear(embedding_vector)
-            pred = out.cpu().argmax(dim=-1).type(torch.int)
-            labels = labels.cpu()
-            total += labels.size(0)
-            correct += (pred == labels).sum()
+        outputs = self.model_linear(embedding_vector)
+        return outputs
+        # emb = self.model_ib(inputs)
+        # return self.model_linear(emb)
+    
+#NOTE: UNFINISHED! Need to implement the contrastive train
+# def train_contrastive(train_loader, val_loader, model, sensors, device, args):
+#     # Train the model
+#     criterion = nn.CrossEntropyLoss()
+#     optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+#     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)  # Add scheduler
+#     num_epochs = args.num_epochs
+    
+#     for epoch in range(num_epochs):
+
+#         for i,inputs  in enumerate(train_loader):
+#             # break # used to quick test eval function
+#             frames, accel_data, labels, pid_idx, rgb_path, imu_path  = inputs
+
+#             # outputs = model(inputs, sensors, fine_tune=True)
+#             # labels = labels.to(device)
+#             # loss = criterion(outputs, labels)
+#             # # Backward and optimize
+#             # optimizer.zero_grad()
+#             # loss.backward()
+#             # optimizer.step()
+
+#             if (i+1) % 1 == 0:
+#                 if args.rank == 0 or args.single_gpu:
+#                     print (f'Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(train_loader)}], Loss: {loss.item():.4f}')
+#                     if not args.no_wandb: wandb.log({"Train Loss": loss.item()})
+        
+#         scheduler.step()  # Step the scheduler
+
+#         if (epoch+1) % args.eval_every == 0:
+#             acc = evaluate_ib(model, sensors, val_loader, device)
+#             if args.rank == 0 or args.single_gpu: 
+#                 print(f'Epoch [{epoch+1}/{num_epochs}],  Val Acc: {acc:.4f}')
+#                 if not args.no_wandb: wandb.log({"Val Accuracy": acc})
+
+#                 #save the model 
+#                 torch.save(model.state_dict(), f'model_linear_{sensors}.ckpt')
+
+#     print('Finished CLIPTraining')
+
+def train_linear(train_loader, val_loader, model, sensors, args):
+    # Train the model
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)  # Add scheduler
+    num_epochs = args.num_epochs
+    device = args.device
+
+    for epoch in range(num_epochs):
+
+        for i,inputs  in enumerate(train_loader):
+            # break # used to quick test eval function
+            frames, accel_data, labels, pid_idx, rgb_path, imu_path  = inputs
+
+            # outputs = model.model_linear(embedding_vector)
+            outputs = model(inputs, sensors, device, fine_tune=True)
+            labels = labels.to(device)
+            loss = criterion(outputs, labels)
+            # Backward and optimize
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            if (i+1) % 1 == 0:
+                if args.rank == 0 or args.single_gpu:
+                    print (f'Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(train_loader)}], Loss: {loss.item():.4f}')
+                    if not args.no_wandb: wandb.log({"Train Loss": loss.item()})
+        
+        scheduler.step()  # Step the scheduler
+
+        if (epoch+1) % args.eval_every == 0:
+            acc = evaluate_ib(model, sensors, val_loader, args)
+            if args.rank == 0 or args.single_gpu: 
+                print(f'Epoch [{epoch+1}/{num_epochs}],  Val Acc: {acc:.4f}')
+                if not args.no_wandb: wandb.log({"Val Accuracy": acc})
+
+                #save the model 
+                torch.save(model.state_dict(), f'model_linear_{sensors}.ckpt')
+
+    print('Finished Training')
+
+def evaluate_ib(model, sensors, val_loader, args):
+    model.eval()
+    correct = 0
+    total = 0
+    device = args.device
+    for i,inputs  in enumerate(val_loader):
+        frames, accel_data, labels, pid_idx, rgb_path, imu_path  = inputs
+        out = model(inputs, sensors, device)
+        pred = out.cpu().argmax(dim=-1).type(torch.int)
+        labels = labels.cpu()
+        total += labels.size(0)
+        correct += (pred == labels).sum()
+
+        # Convert to tensor and aggregate across all processes
+        correct_tensor = torch.tensor(correct, dtype=torch.float32, device=device)
+        total_tensor = torch.tensor(total, dtype=torch.float32, device=device)
+
+        if not args.single_gpu:
+            # All reduce
+            dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
      
     return 100.* correct/total
 
-class imagebind_baseline(nn.Module):
-    def __init__(self):
-        super(imagebind_baseline, self).__init__()
-        # Instantiate model
-        self.model_ib = imagebind_model.imagebind_huge(pretrained=True)
-        self.model_linear = nn.Sequential(# Pytorch 2 layer MLP
-            nn.Linear(1024, 512),
-            nn.ReLU(),
-            nn.Linear(512, model_info['num_classes'])
-        ) # don't need another relu, bc softmax (sigmoid activation) is applied in the loss function
 
-    def forward(self, inputs):
-        emb = self.model_ib(inputs)
-        return self.model_linear(emb)
     
 if __name__ == "__main__":    
     # video_paths=["/media/abhi/Seagate-FireCUDA/utd-mhad/RGB/a27_s4_t3_color.avi"]
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    args = argparse.ArgumentParser() # can't keep this global otherwise will conflict with FACT/train.py, when that file imports this file.
     args.add_argument("--sensors", type=str, default="vision", help="Choose between vision, imu or both")
     args.add_argument("--zero_shot", type=bool, default=False, help="Choose between vision, imu or both")
-    args.add_argument("--batch_size", type=int, default=32, help="Choose between vision, imu or both")
+    args.add_argument("--batch_size", type=int, default=16, help="Choose between vision, imu or both")
     args.add_argument("--device", type=str, default=device, help="cuda device")
     args.add_argument("--dataset", type=str, default="utd-mhad", help="Choose between utd-mhad, mmact, mmea, czu-mhad")
-    args.add_argument("--wandb", type=bool, default=False, help="Choose between utd-mhad, mmact, mmea, czu-mhad")
+    args.add_argument('--no_wandb', action='store_true',default=False)
     args.add_argument('--single_gpu', action='store_true',default=True) # default use DDP multi GPU.
+    args.add_argument('--eval_every', type=int, default=10) # how often to perform eval (every eval_every epochs)
+    args.add_argument('--num_epochs', type=int, default=10) 
+
     args = args.parse_args()
 
     device = args.device
+
+    #dummies to be compatible with fact train
+    args.rank = 0
+    args.signal_gpu = True
+
 
 
     # print(model.device)
@@ -268,7 +316,7 @@ if __name__ == "__main__":
     # Load the dataloaders
     train_loader, train_2_loader, val_loader, test_loader, model_info = load_dataloaders(dataset, model_info, rgb_video_length, imu_length, world_size, args, return_path=True)
 
-    model = imagebind_baseline()
+    model = ImageBind_baseline(output_size=model_info['num_classes'])
     model.to(device)
 
     print(args)
@@ -278,7 +326,7 @@ if __name__ == "__main__":
         zero_shot_imagebind(val_loader, model.model_ib, args.sensors, device)
     else:
         print("finetuning a linear layer:")
-        if args.wandb: wandb.init(project="imagebind-finetune")
+        if not args.no_wandb: wandb.init(project="imagebind-finetune")
 
 
         # model_linear.to(device)
@@ -293,4 +341,4 @@ if __name__ == "__main__":
         # args.sensors = "imu"
         # train_linear(train_loader, test_loader, model, model_linear, args.sensors, device)
 
-        # evaluate(model, model_linear, args.sensors, test_loader, device)
+        # evaluate_ib(model, model_linear, args.sensors, test_loader, device)
