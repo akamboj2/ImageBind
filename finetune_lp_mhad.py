@@ -12,14 +12,13 @@ from datasets.dataset import RGB_IMU_Dataset, load_dataloaders
 # from dataset_mhad import CZUMHADDataset
 
 import os
-
+import sys
 import wandb
 import torchvision.transforms as transforms
 import torch.nn as nn
 import argparse
 
 import torch.distributed as dist
-
 
 actions_dict = {
     1: 'A person swipes their hand to the left.',
@@ -103,7 +102,7 @@ def zero_shot_imagebind(val_loader, model, sensors, device):
     print("Computing accuracy...")
     # print("Vision x Text: ", sftmx)
 
-    accuracy = correct / len(val_dataset) * 100
+    accuracy = correct / len(val_loader) * 100
     print("Accuracy: ", accuracy)
 
 
@@ -206,9 +205,10 @@ def train_linear(train_loader, val_loader, model, sensors, args):
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)  # Add scheduler
     num_epochs = args.num_epochs
     device = args.device
-
+    if args.dataset == "czu-mhad":
+        sensors = "depth"
+    
     for epoch in range(num_epochs):
-
         for i,inputs  in enumerate(train_loader):
             # break # used to quick test eval function
             frames, accel_data, labels, pid_idx, rgb_path, imu_path  = inputs
@@ -230,13 +230,15 @@ def train_linear(train_loader, val_loader, model, sensors, args):
         scheduler.step()  # Step the scheduler
 
         if (epoch+1) % args.eval_every == 0:
-            acc = evaluate_ib(model, sensors, val_loader, args)
+            # acc = evaluate_ib(model, sensors, val_loader, args)
+            acc_rgb, acc_imu, acc_both = eval_log_ib(model, val_loader, args, eval_sensors=["vision"])
+            acc = acc_rgb
             if args.rank == 0 or args.single_gpu: 
                 print(f'Epoch [{epoch+1}/{num_epochs}],  Val Acc: {acc:.4f}')
                 if not args.no_wandb: wandb.log({"Val Accuracy": acc})
 
                 #save the model 
-                torch.save(model.state_dict(), f'model_linear_{sensors}.ckpt')
+                torch.save(model.state_dict(), f'./models/ib_linear_{sensors}.ckpt')
 
     print('Finished Training')
 
@@ -265,6 +267,32 @@ def evaluate_ib(model, sensors, val_loader, args):
     return 100.* correct/total
 
 
+def eval_log_ib(model, val_loader, args, eval_sensors=["vision", "imu", "both"]):
+    device = args.device
+
+    #Finally evaluate on camera->HAR, imu->HAR, camera+imu->HAR
+    if "vision" in eval_sensors:
+        if args.rank==0 or args.single_gpu: print("Evaluating on RGB only")
+        acc_rgb = evaluate_ib(model, "vision", val_loader, args)
+        if args.rank==0: 
+            if not args.no_wandb: wandb.log({'val_acc_RGB': acc_rgb})
+            print('Test accuracy RGB: {:.4f} %'.format(acc_rgb))
+
+    if "imu" in eval_sensors:
+        if args.rank==0 or args.single_gpu: print("Evaluating on IMU only")
+        acc_imu = evaluate_ib(model, "imu", val_loader, args)
+        if args.rank==0 or args.single_gpu: 
+            if not args.no_wandb: wandb.log({'val_acc_IMU': acc_imu})
+            print('Test accuracy IMU: {:.4f} %'.format(acc_imu))
+
+    if "both" in eval_sensors:
+        if args.rank==0 or args.single_gpu: print("Evaluating on RGB and IMU")
+        acc_both = evaluate_ib(model, "both", val_loader, args)
+        if args.rank==0 or args.single_gpu: 
+            if not args.no_wandb: wandb.log({'val_acc_both': acc_both})
+            print('Test accuracy: {:.4f} %'.format(acc_both))
+
+    return acc_rgb.item(), acc_imu.item(), acc_both.item()
     
 if __name__ == "__main__":    
     # video_paths=["/media/abhi/Seagate-FireCUDA/utd-mhad/RGB/a27_s4_t3_color.avi"]
