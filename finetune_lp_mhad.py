@@ -57,7 +57,8 @@ def load_and_transform_imu_data(imu_data, device):
     imu_data = imu_data.permute(0,2,1)
 
     target_imu = torch.zeros(imu_data.shape[0],6,2000) # could also try upsampling instead of concat with zeros.
-    target_imu[:,:,:imu_data.shape[2]] = imu_data
+    target_imu[:,:,:imu_data.shape[2]] = imu_data[:,:6,:] #if the imu data has more than 6 channels just use the first 6
+    # it's not my fault imagebind is rigid and not adaptable to more imu channels -> i shouldn't have to spend time trying to extend it's funcitonality
     target_imu = target_imu.to(device)
     
     return target_imu
@@ -118,9 +119,9 @@ class ImageBind_baseline(nn.Module):
         ) # don't need another relu, bc softmax (sigmoid activation) is applied in the loss function
 
     def forward(self, inputs, sensors, device, fine_tune=False, clip_align=False):
-        if fine_tune:
-            self.model_ib.eval() # Might need to manually freeze the weights, this might not be enough
-            self.model_linear.train()
+        # if fine_tune: # moving this to train function
+        #     self.model_ib.eval() # Might need to manually freeze the weights, this might not be enough
+        #     self.model_linear.train()
         # Load and transform video data
         frames, accel_data, labels, pid_idx, rgb_path, imu_path  = inputs
         with torch.no_grad():
@@ -150,6 +151,13 @@ class ImageBind_baseline(nn.Module):
                 }
                 emb = self.model_ib(inputs)
                 embedding_vector = emb[ModalityType.DEPTH]
+            elif sensors == "both_depth":
+                inputs = {
+                    ModalityType.IMU: load_and_transform_imu_data(accel_data, device),
+                    ModalityType.DEPTH: frames.to(device)
+                }
+                emb = self.model_ib(inputs)
+                embedding_vector = (emb[ModalityType.IMU]+emb[ModalityType.DEPTH])/2
             else:
                 raise ValueError("Invalid sensor type: ", sensors)
 
@@ -208,6 +216,18 @@ def train_linear(train_loader, val_loader, model, sensors, args):
     if args.dataset == "czu-mhad":
         sensors = "depth"
     
+    if args.single_gpu:
+        model.model_linear.train()
+        # freeze model.model_ib weights
+        for param in model.model_ib.parameters():
+            param.requires_grad = False
+    else:
+        model.module.model_linear.train()
+        # DDP
+        for param in model.module.model_ib.parameters():
+            param.requires_grad = False
+
+    
     for epoch in range(num_epochs):
         for i,inputs  in enumerate(train_loader):
             # break # used to quick test eval function
@@ -230,12 +250,16 @@ def train_linear(train_loader, val_loader, model, sensors, args):
         scheduler.step()  # Step the scheduler
 
         if (epoch+1) % args.eval_every == 0:
+            # Evaluation without wandb log
             # acc = evaluate_ib(model, sensors, val_loader, args)
-            acc_rgb, acc_imu, acc_both = eval_log_ib(model, val_loader, args, eval_sensors=["vision"])
+            # Evaluate log with all combinations of sensors
+            acc_rgb, acc_imu, acc_both = eval_log_ib(model, val_loader, args)
+            # Eval log with only vision
+            # acc_rgb = eval_log_ib(model, val_loader, args, eval_sensors=["vision"])[0]
             acc = acc_rgb
             if args.rank == 0 or args.single_gpu: 
-                print(f'Epoch [{epoch+1}/{num_epochs}],  Val Acc: {acc:.4f}')
-                if not args.no_wandb: wandb.log({"Val Accuracy": acc})
+                # print(f'Epoch [{epoch+1}/{num_epochs}],  Val Acc RGB: {acc:.4f}')
+                # if not args.no_wandb: wandb.log({"Val Accuracy": acc})
 
                 #save the model 
                 torch.save(model.state_dict(), f'./models/ib_linear_{sensors}.ckpt')
@@ -247,6 +271,11 @@ def evaluate_ib(model, sensors, val_loader, args):
     correct = 0
     total = 0
     device = args.device
+    if args.dataset == "czu-mhad":
+        if sensors == "vision":
+            sensors = "depth"
+        elif sensors=="both":
+            sensors = "both_depth"
     for i,inputs  in enumerate(val_loader):
         frames, accel_data, labels, pid_idx, rgb_path, imu_path  = inputs
         out = model(inputs, sensors, device)
@@ -270,6 +299,7 @@ def evaluate_ib(model, sensors, val_loader, args):
 def eval_log_ib(model, val_loader, args, eval_sensors=["vision", "imu", "both"]):
     device = args.device
 
+    return_vals = []
     #Finally evaluate on camera->HAR, imu->HAR, camera+imu->HAR
     if "vision" in eval_sensors:
         if args.rank==0 or args.single_gpu: print("Evaluating on RGB only")
@@ -277,6 +307,7 @@ def eval_log_ib(model, val_loader, args, eval_sensors=["vision", "imu", "both"])
         if args.rank==0: 
             if not args.no_wandb: wandb.log({'val_acc_RGB': acc_rgb})
             print('Test accuracy RGB: {:.4f} %'.format(acc_rgb))
+        return_vals.append(acc_rgb.item())
 
     if "imu" in eval_sensors:
         if args.rank==0 or args.single_gpu: print("Evaluating on IMU only")
@@ -284,6 +315,7 @@ def eval_log_ib(model, val_loader, args, eval_sensors=["vision", "imu", "both"])
         if args.rank==0 or args.single_gpu: 
             if not args.no_wandb: wandb.log({'val_acc_IMU': acc_imu})
             print('Test accuracy IMU: {:.4f} %'.format(acc_imu))
+        return_vals.append(acc_imu.item())
 
     if "both" in eval_sensors:
         if args.rank==0 or args.single_gpu: print("Evaluating on RGB and IMU")
@@ -291,8 +323,9 @@ def eval_log_ib(model, val_loader, args, eval_sensors=["vision", "imu", "both"])
         if args.rank==0 or args.single_gpu: 
             if not args.no_wandb: wandb.log({'val_acc_both': acc_both})
             print('Test accuracy: {:.4f} %'.format(acc_both))
+        return_vals.append(acc_both.item())
 
-    return acc_rgb.item(), acc_imu.item(), acc_both.item()
+    return return_vals
     
 if __name__ == "__main__":    
     # video_paths=["/media/abhi/Seagate-FireCUDA/utd-mhad/RGB/a27_s4_t3_color.avi"]
@@ -358,8 +391,6 @@ if __name__ == "__main__":
 
 
         # model_linear.to(device)
-
-
         # TODO: Maybe should first align with both imu and vision modalities
         
         # Train the task head with just vision modality
